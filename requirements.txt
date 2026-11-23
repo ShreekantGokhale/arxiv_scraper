@@ -1,0 +1,7 @@
+requests>=2.31
+SQLAlchemy>=2.0
+PyMySQL>=1.1
+cryptography>=42      # needed by PyMySQL for MySQL 8 password authentication
+python-dotenv>=1.0
+tzdata>=2024.1        # time-zone database; Windows has none built in (needed for US Eastern dates)
+pytest>=7
