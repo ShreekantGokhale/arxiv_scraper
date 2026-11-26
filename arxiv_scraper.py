@@ -45,8 +45,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from models import (OTHER_CATEGORIES_INDEX, OTHER_CATEGORIES_INDEX_SQL, Base, Category,
-                    CrawlLog, Paper, utcnow)
+from models import EXTRA_INDEXES, LEGACY_INDEXES, Base, Category, CrawlLog, Paper, utcnow
 from taxonomy import CATEGORIES, TAXONOMY, expand
 
 try:  # read DATABASE_URL / S2_API_KEY from a .env file next to the scripts, if present
@@ -315,22 +314,42 @@ def make_engine(db_url: str | URL) -> Engine:
     if engine.dialect.name != "mysql":
         raise ValueError(f"Expected a MySQL URL (mysql+pymysql://...), got {engine.dialect.name!r}")
     Base.metadata.create_all(engine)
-    ensure_other_categories_index(engine)
+    ensure_indexes(engine)
     seed_categories(engine)
     return engine
 
 
-def ensure_other_categories_index(engine: Engine) -> None:
+def ensure_indexes(engine: Engine) -> None:
+    """Drop models.LEGACY_INDEXES if present, then create missing models.EXTRA_INDEXES."""
     with engine.connect() as conn:
-        exists = conn.scalar(text(
-            "SELECT COUNT(*) FROM information_schema.statistics "
-            "WHERE table_schema = DATABASE() AND table_name = 'papers' AND index_name = :name"),
-            {"name": OTHER_CATEGORIES_INDEX})
-        if not exists:
+        existing = set(conn.scalars(text(
+            "SELECT DISTINCT index_name FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = 'papers'")))
+        # Drop first: building another index rebuilds the table, which is what crashes
+        # MySQL 8.4 while the multi-valued index exists.
+        for name in LEGACY_INDEXES:
+            if name in existing:
+                log.info("Dropping index %s (no longer used; can crash MySQL 8.4)", name)
+                conn.execute(text(f"DROP INDEX {name} ON papers"))
+        missing = [name for name in EXTRA_INDEXES if name not in existing]
+        if not missing:
+            return
+        # Adding a FULLTEXT index to a table that already holds rows rebuilds the table, and
+        # that has crashed the MySQL server itself (seen on MySQL 9.5 on Windows). On an empty
+        # table it's safe, so only ever create these indexes before the first paper is saved.
+        if conn.scalar(text("SELECT EXISTS (SELECT 1 FROM papers)")):
+            log.warning(
+                "Not adding index(es) %s: the papers table already has data, and adding a "
+                "FULLTEXT index to a filled table can crash MySQL. Keyword search (q / topic) "
+                "is unavailable until you recreate the database; see README, Troubleshooting.",
+                ", ".join(missing))
+            return
+        for name in missing:
+            log.info("Creating index %s", name)
             try:
-                conn.execute(text(OTHER_CATEGORIES_INDEX_SQL))
-            except DBAPIError as exc:  # needs MySQL 8.0.17+; queries still work without it
-                log.warning("Skipping multi-valued index on other_categories: %s", exc.orig)
+                conn.execute(text(EXTRA_INDEXES[name]))
+            except DBAPIError as exc:
+                log.warning("Skipping index %s: %s", name, exc.orig)
 
 
 def _category_row(code: str) -> dict:

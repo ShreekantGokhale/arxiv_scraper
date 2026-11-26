@@ -232,7 +232,7 @@ def test_crawl_per_category_per_day_and_resume(engine):
         assert db.get(Category, "cmp-lg").name is None                  # legacy code auto-added
         log = {(r.category, r.day): (r.total_results, r.fetched) for r in db.scalars(select(CrawlLog))}
         assert log[("cs.LG", start)] == (2, 2) and log[("cs.CL", end)] == (0, 0)
-        # JSON array lookup (served by the multi-valued index)
+        # JSON array lookup
         hits = db.scalars(select(Paper.title).where(
             func.json_contains(Paper.other_categories, func.json_quote("cs.RO")))).all()
         assert hits == ["Diffusion Policies"]

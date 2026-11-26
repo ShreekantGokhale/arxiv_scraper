@@ -79,11 +79,16 @@ class CrawlLog(Base):
     finished_at: Mapped[datetime] = mapped_column(UtcDateTime, default=utcnow)
 
 
-# Multi-valued index (MySQL 8.0.17+) so "papers cross-listed in X" queries using
-# MEMBER OF / JSON_CONTAINS on the JSON array don't scan the whole table.
-# MySQL has no CREATE INDEX IF NOT EXISTS, so make_engine() checks first.
-OTHER_CATEGORIES_INDEX = "ix_papers_other_categories"
-OTHER_CATEGORIES_INDEX_SQL = (
-    f"CREATE INDEX {OTHER_CATEGORIES_INDEX} ON papers "
-    "((CAST(other_categories AS CHAR(32) ARRAY)))"
-)
+# Indexes that create_all() won't add to an existing table.
+# MySQL has no CREATE INDEX IF NOT EXISTS, so make_engine() checks each one first.
+EXTRA_INDEXES = {
+    # Full-text index for keyword search over titles and abstracts (used by the API).
+    "ft_papers_title_abstract":
+        "CREATE FULLTEXT INDEX ft_papers_title_abstract ON papers (title, abstract)",
+}
+
+# Indexes from earlier versions that make_engine() drops if present (dropping is instant).
+# The multi-valued JSON index on other_categories can crash MySQL 8.4 whenever the table is
+# rebuilt, e.g. when the full-text index is added (MySQL bug #121044). At this data size,
+# cross-list lookups are fast without it.
+LEGACY_INDEXES = ["ix_papers_other_categories"]

@@ -134,11 +134,11 @@ def test_scraper_upsert_keeps_citation_counts(engine):
 @needs_db
 def test_mysql_schema_details(engine):
     with engine.connect() as conn:
-        idx = conn.execute(text(
-            "SELECT index_name, expression FROM information_schema.statistics "
-            "WHERE table_schema = DATABASE() AND table_name = 'papers' "
-            "AND index_name = 'ix_papers_other_categories'")).all()
-        assert len(idx) == 1 and "array" in idx[0][1].lower()        # multi-valued index
+        indexes = set(conn.scalars(text(
+            "SELECT DISTINCT index_name FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = 'papers'")))
+        assert "ft_papers_title_abstract" in indexes
+        assert "ix_papers_other_categories" not in indexes      # crash-prone on MySQL 8.4
         charset = conn.scalar(text(
             "SELECT table_collation FROM information_schema.tables "
             "WHERE table_schema = DATABASE() AND table_name = 'papers'"))
@@ -148,6 +148,44 @@ def test_mysql_schema_details(engine):
             "AND table_name = 'papers' AND column_name = 'citations_updated_at'"))
         assert precision == 6
     s.make_engine(DB_URL).dispose()  # running setup twice is harmless (index already exists)
+
+
+def paper_indexes(conn):
+    return set(conn.scalars(text(
+        "SELECT DISTINCT index_name FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() AND table_name = 'papers'")))
+
+
+@needs_db
+def test_filled_old_table_gets_legacy_index_dropped_but_no_risky_rebuild(engine, caplog):
+    """
+    A database built by an earlier version: multi-valued index, no full-text index, data.
+    The legacy index is dropped (instant, safe); the full-text index is NOT added, because
+    adding one to a filled table rebuilds it, which has crashed MySQL 9.5. These tests never
+    run that operation, so they are safe to run on any MySQL version.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX ft_papers_title_abstract ON papers"))      # empty table: safe
+        conn.execute(text("CREATE INDEX ix_papers_other_categories ON papers "    # empty table: safe
+                          "((CAST(other_categories AS CHAR(32) ARRAY)))"))
+    load_papers(engine)
+    s.make_engine(DB_URL).dispose()
+    with engine.connect() as conn:
+        assert paper_indexes(conn).isdisjoint({"ix_papers_other_categories", "ft_papers_title_abstract"})
+        assert conn.scalar(text("SELECT COUNT(*) FROM papers")) == 3
+    assert "Not adding index(es) ft_papers_title_abstract" in caplog.text
+
+
+@needs_db
+def test_empty_table_gets_fulltext_index(engine):
+    with engine.begin() as conn:
+        conn.execute(text("DROP INDEX ft_papers_title_abstract ON papers"))
+    s.make_engine(DB_URL).dispose()
+    load_papers(engine)
+    with engine.connect() as conn:
+        assert "ft_papers_title_abstract" in paper_indexes(conn)
+        assert conn.scalar(text("SELECT COUNT(*) FROM papers WHERE "
+                                "MATCH(title, abstract) AGAINST ('+diffusion*' IN BOOLEAN MODE)")) == 1
 
 
 @needs_db

@@ -3,7 +3,8 @@
 Builds a MySQL database of arXiv papers (title, authors, main category, other
 categories, announcement date, abstract, full-paper link) by harvesting the
 **official arXiv API** one *(category, submission day)* pair at a time.
-A second step adds **citation counts from Semantic Scholar**.
+A second step adds **citation counts from Semantic Scholar**, and a **FastAPI**
+service lets you search, filter and rank the papers over HTTP.
 
 ## Files
 
@@ -11,18 +12,22 @@ A second step adds **citation counts from Semantic Scholar**.
 |---|---|
 | `arxiv_scraper.py` | Step 1: HTTP client, Atom parser, crawl loop, CLI |
 | `enrich_citations.py` | Step 2: Semantic Scholar citation lookup, 500 papers per request |
+| `api/main.py` | Step 3: FastAPI app and all endpoints |
+| `api/search.py` | Keyword-search parser and topic shortcuts (RAG, GenAI, …) |
+| `api/schemas.py` | Pydantic response models (the JSON shapes shown on `/docs`) |
+| `api/db.py` | Database session for each API request |
 | `models.py` | SQLAlchemy 2.0 models: `Category`, `Paper`, `CrawlLog` |
 | `taxonomy.py` | All 155 arXiv categories, grouped by archive and group |
 | `.env.example` | Template for your database settings and API key |
 | `conftest.py` | Shared test fixtures (throwaway MySQL schema, no sleeping) |
 | `test_arxiv_scraper.py` | Tests: parser, retries, pagination, DB upserts, resume |
 | `test_enrich_citations.py` | Tests: batch lookups, retries, refresh logic, MySQL schema details |
+| `test_api.py` | Tests: every endpoint, filters, search, sorting, validation |
 
 ## Requirements
 
 - **Python 3.10 or newer**
-- **MySQL 8.0.17 or newer.** The scraper uses JSON columns and a multi-valued index.
-  On older versions the index is skipped with a warning, and everything else still works.
+- **MySQL 8.0 or newer.** The scraper uses JSON columns and a FULLTEXT index.
 
 ## Setup
 
@@ -81,6 +86,59 @@ than `--refresh-days` ago (default 30). Rerun it monthly to keep counts current.
 It sends one request per 500 papers, so 100,000 papers take about 200 requests:
 roughly 4 minutes with a key (`S2_API_KEY` in `.env`), or 10 without one.
 
+### Step 3: the API
+
+```bash
+python -m uvicorn api.main:app --reload
+```
+
+Then open **http://127.0.0.1:8000/docs**: an interactive page where you can try
+every endpoint. `--reload` restarts the server when you edit the code; press
+Ctrl+C to stop it.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /papers` | Paper list with filters, keyword search, sorting and pages |
+| `GET /papers/{arxiv_id}` | One paper with its full abstract |
+| `GET /papers/popular` | Top papers by citations per month, total citations or influential citations |
+| `GET /categories` | Categories with main and cross-listed paper counts |
+| `GET /stats/daily` | Papers announced per day (for charts) |
+| `GET /topics` | Topic shortcuts usable as `?topic=` |
+| `GET /health` | API and database check |
+
+`/papers`, `/papers/popular` and `/stats/daily` share these filters:
+
+| Parameter | Example | Meaning |
+|---|---|---|
+| `category` | `cs.CL` or `cs.CL,cs.HC` or `cs` | Main category or cross-list (archives expand) |
+| `primary_only` | `true` | Only match the main category |
+| `start_date`, `end_date` | `2025-01-01` | Announcement date range |
+| `q` | `"knowledge graph" medical` | Keywords in title/abstract; all must match; quotes for phrases |
+| `topic` | `rag`, `llm`, `genai`, `agents`, `prompting`, `hallucination`, `human_ai` | Ready-made topic search |
+
+Example requests:
+
+```
+/papers?topic=rag&category=cs.CL&sort=most_cited
+/papers?q=retrieval-augmented agents&start_date=2025-03-01&end_date=2025-04-30
+/papers/popular?topic=genai&metric=citations_per_month&limit=10
+/papers/popular?category=cs.HC&metric=influential
+/stats/daily?topic=llm&category=cs.AI
+/papers/2501.01234
+```
+
+**How search works.** Keyword search uses a MySQL FULLTEXT index on title and
+abstract, which the scraper creates automatically. Raw input is rebuilt into a
+safe boolean-mode query, because MySQL has some traps:
+- **Every word is required**, and words also match their plurals (`agent` finds `agents`).
+- **Hyphens:** `retrieval-augmented` is searched as a phrase. Unquoted, MySQL would read the `-` as NOT.
+- **Short words and stopwords** (`AI`, `the`) are ignored outside quotes, because MySQL doesn't index them. Put them in a phrase: `"generative AI"`.
+- **Operator characters** in user input are removed.
+
+GenAI and RAG are research topics, not arXiv categories, so `?topic=` expands
+to a set of phrases (see `GET /topics` or `api/search.py`, where you can add
+your own topics).
+
 ## Schema
 
 **`papers`** (InnoDB, utf8mb4)
@@ -92,7 +150,7 @@ roughly 4 minutes with a key (`S2_API_KEY` in `.env`), or 10 without one.
 | `title` | TEXT | whitespace normalised |
 | `authors` | JSON | array of names, in author order |
 | `primary_category` | VARCHAR(32) FK → `categories.code` | main category |
-| `other_categories` | JSON | array of all other categories; multi-valued index |
+| `other_categories` | JSON | array of all other categories |
 | `submitted_at` | DATETIME(6) | version-1 submission time, UTC |
 | `announced_date` | DATE | computed from arXiv's schedule (below) |
 | `abstract` | TEXT | the API's `<summary>` |
@@ -135,10 +193,15 @@ several queries. `INSERT … ON DUPLICATE KEY UPDATE` keeps exactly one row per
 paper and refreshes it when a newer version appears.
 
 **Lists in MySQL.** MySQL has no array type, so `authors` and
-`other_categories` are JSON arrays. A multi-valued index
-(`CAST(other_categories AS CHAR(32) ARRAY)`) lets `MEMBER OF` and
-`JSON_CONTAINS` lookups avoid scanning the whole table. A later normalisation
-step can move both into link tables (`paper_authors`, `paper_categories`).
+`other_categories` are JSON arrays, queried with `MEMBER OF` / `JSON_CONTAINS`.
+A later normalisation step can move both into link tables (`paper_authors`,
+`paper_categories`), which also makes cross-list lookups indexable.
+
+An earlier version also put a *multi-valued index* on `other_categories`. It was
+removed because MySQL 8.4 can crash while rebuilding such an index over arrays
+that are a mix of empty and non-empty (MySQL bug #121044), and a rebuild happens
+whenever the table is altered, e.g. when the FULLTEXT index is added. The scraper
+drops it automatically from databases created by that version.
 
 **Robustness.**
 - Retries with exponential backoff on network errors and HTTP 5xx.
@@ -180,7 +243,7 @@ queries below). Influential citations are a stricter signal than the total.
 SELECT announced_date, COUNT(*) FROM papers
 WHERE primary_category = 'cs.CL' GROUP BY announced_date ORDER BY announced_date;
 
--- Papers cross-listed in cs.RO (uses the multi-valued index)
+-- Papers cross-listed in cs.RO
 SELECT title, primary_category FROM papers WHERE 'cs.RO' MEMBER OF (other_categories);
 
 -- First author and author count
@@ -216,12 +279,31 @@ SELECT SUM(citations_updated_at IS NULL)                              AS never_c
 FROM papers;
 ```
 
+## Troubleshooting
+
+**MySQL stops ("Lost connection to MySQL server during query", then "Can't connect")
+when a script starts.** Adding the keyword-search (FULLTEXT) index to a `papers`
+table that already holds rows makes MySQL rebuild the table, and that has crashed
+the MySQL server itself (seen on MySQL 9.5 on Windows). The scripts now create the
+index only while the table is empty, and otherwise log
+`Not adding index(es) ft_papers_title_abstract ...`. If you see that warning, or
+the API answers *"Keyword search index is missing"*, recreate the database:
+
+1. Start MySQL again if it stopped (Windows: Services → MySQL → Start).
+2. In the MySQL client:
+   ```sql
+   DROP DATABASE arxiv;
+   CREATE DATABASE arxiv CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+   ```
+3. Run `arxiv_scraper.py` again. It creates the tables and the index while they
+   are empty, and inserting papers afterwards is safe.
+
 ## Tests
 
 ```bash
-python -m pytest -q                              # parser/client tests only (23)
+python -m pytest -q                              # tests that need no database (37)
 TEST_DATABASE_URL="mysql+pymysql://root:PASSWORD@localhost:3306/arxiv_test?charset=utf8mb4" \
-    python -m pytest -q                          # + MySQL tests (32 total)
+    python -m pytest -q                          # + MySQL tests (56 total)
 ```
 
 The database tests **drop and recreate** the tables in `TEST_DATABASE_URL`, so
